@@ -45,7 +45,7 @@ def make_env(env_id=ENV_ID, num_envs=1):
 
     Returns obs shape: (num_envs, 4, 84, 84) as uint8.
     """
-    envs = gym.make_vec(env_id, num_envs=num_envs, vectorization_mode="sync",
+    envs = gym.make_vec(env_id, num_envs=num_envs, vectorization_mode="async",
                         frameskip=1, repeat_action_probability=0,
                         wrappers=[_atari_preprocess])
     return envs
