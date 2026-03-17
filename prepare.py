@@ -18,6 +18,7 @@ import torch
 
 try:
     import pufferlib
+    import pufferlib.vector
     import pufferlib.environments.atari
     BACKEND = "pufferlib"
 except ImportError:
@@ -62,7 +63,12 @@ def make_env(env_id=None, num_envs=1):
         env_id = ENV_ID
 
     if BACKEND == "pufferlib":
-        return pufferlib.environments.atari.make(env_id, num_envs=num_envs)
+        return pufferlib.vector.make(
+            pufferlib.environments.atari.env_creator(env_id),
+            env_kwargs=dict(framestack=4),
+            backend=pufferlib.vector.Multiprocessing,
+            num_envs=num_envs,
+        )
     else:
         return gym.make_vec(env_id, num_envs=num_envs, vectorization_mode="sync",
                             frameskip=1, repeat_action_probability=0,
