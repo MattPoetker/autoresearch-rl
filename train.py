@@ -17,7 +17,7 @@ from prepare import TIME_BUDGET, ENV_ID, make_env, evaluate_return
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-NUM_ENVS = 16            # number of parallel environments
+NUM_ENVS = 128           # number of parallel environments
 NUM_STEPS = 128          # rollout length per update
 LR = 2.5e-4             # learning rate
 GAMMA = 0.99             # discount factor
@@ -37,7 +37,7 @@ HIDDEN_SIZE = 512        # hidden layer size
 class Agent(nn.Module):
     def __init__(self, obs_shape, num_actions):
         super().__init__()
-        c, h, w = obs_shape  # (4, 84, 84)
+        c, h, w = obs_shape
         self.conv = nn.Sequential(
             nn.Conv2d(c, 32, 8, stride=4),
             nn.ReLU(),
@@ -86,7 +86,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Create vectorized environments
 env = make_env(ENV_ID, num_envs=NUM_ENVS)
-obs_shape = env.single_observation_space.shape  # (4, 84, 84)
+obs_shape = env.single_observation_space.shape
 num_actions = env.single_action_space.n
 print(f"Env: {ENV_ID}, obs_shape: {obs_shape}, num_actions: {num_actions}")
 print(f"NUM_ENVS: {NUM_ENVS}, NUM_STEPS: {NUM_STEPS}")
@@ -123,7 +123,7 @@ total_frames = 0
 num_updates = 0
 
 obs_np, _ = env.reset()
-next_obs = torch.from_numpy(np.array(obs_np))
+next_obs = torch.from_numpy(np.asarray(obs_np))
 next_done = torch.zeros(NUM_ENVS)
 
 while True:
@@ -149,9 +149,9 @@ while True:
         values_buf[step] = value.flatten().cpu()
 
         obs_np, reward, term, trunc, info = env.step(action.cpu().numpy())
-        next_obs = torch.from_numpy(np.array(obs_np))
-        next_done = torch.from_numpy(term | trunc).float()
-        rewards_buf[step] = torch.from_numpy(np.array(reward, dtype=np.float32))
+        next_obs = torch.from_numpy(np.asarray(obs_np))
+        next_done = torch.from_numpy(np.asarray(term | trunc)).float()
+        rewards_buf[step] = torch.from_numpy(np.asarray(reward, dtype=np.float32))
 
     # --- GAE computation ---
     with torch.no_grad():
