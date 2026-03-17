@@ -87,8 +87,11 @@ if __name__ == "__main__":
 
     # Create vectorized environments
     env = make_env(ENV_ID, num_envs=NUM_ENVS)
-    obs_shape = env.single_observation_space.shape
-    num_actions = env.single_action_space.n
+    # envpool uses observation_space/action_space, gymnasium uses single_*
+    _obs_space = getattr(env, 'single_observation_space', env.observation_space)
+    _act_space = getattr(env, 'single_action_space', env.action_space)
+    obs_shape = _obs_space.shape
+    num_actions = _act_space.n
     print(f"Env: {ENV_ID}, obs_shape: {obs_shape}, num_actions: {num_actions}")
     print(f"NUM_ENVS: {NUM_ENVS}, NUM_STEPS: {NUM_STEPS}")
 

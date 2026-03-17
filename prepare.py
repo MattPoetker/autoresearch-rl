@@ -143,13 +143,15 @@ if __name__ == "__main__":
     obs, info = env.reset()
     obs = np.asarray(obs)
     print(f"  Observation shape: {obs.shape}, dtype: {obs.dtype}")
-    print(f"  Single obs shape: {env.single_observation_space.shape}")
-    print(f"  Action space: {env.single_action_space}")
+    _obs_sp = getattr(env, 'single_observation_space', env.observation_space)
+    _act_sp = getattr(env, 'single_action_space', env.action_space)
+    print(f"  Single obs shape: {_obs_sp.shape}")
+    print(f"  Action space: {_act_sp}")
 
     total_reward = 0
     steps = 0
     for _ in range(200):
-        action = np.array([env.single_action_space.sample()])
+        action = np.array([_act_sp.sample()])
         obs, reward, term, trunc, info = env.step(action)
         total_reward += np.sum(reward)
         steps += 1
@@ -165,10 +167,11 @@ if __name__ == "__main__":
     obs = np.asarray(obs)
     print(f"  Observation shape: {obs.shape}, dtype: {obs.dtype}")
 
+    _act_sp2 = getattr(env, 'single_action_space', env.action_space)
     t0 = time.time()
     num_steps = 1000
     for _ in range(num_steps):
-        actions = np.array([env.single_action_space.sample() for _ in range(num_test_envs)])
+        actions = np.array([_act_sp2.sample() for _ in range(num_test_envs)])
         obs, reward, term, trunc, info = env.step(actions)
     dt = time.time() - t0
     fps = num_test_envs * num_steps / dt
