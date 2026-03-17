@@ -1,6 +1,7 @@
 """
 Environment setup and evaluation for autoresearch RL experiments.
-Provides vectorized Atari environments via Gymnasium.
+Uses envpool (fast C++ vectorization) when available,
+falls back to Gymnasium SyncVectorEnv otherwise.
 
 Usage:
     python prepare.py   # verify environment setup
@@ -10,76 +11,98 @@ import time
 
 import numpy as np
 import torch
-import gymnasium as gym
 
-# Register ALE environments
+# ---------------------------------------------------------------------------
+# Backend detection: envpool (fast) or gymnasium (fallback)
+# ---------------------------------------------------------------------------
+
 try:
-    import ale_py
-    gym.register_envs(ale_py)
-except Exception:
-    pass
-
+    import envpool
+    BACKEND = "envpool"
+except ImportError:
+    import gymnasium as gym
+    try:
+        import ale_py
+        gym.register_envs(ale_py)
+    except Exception:
+        pass
+    BACKEND = "gymnasium"
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-ENV_ID = "ALE/Breakout-v5"  # Gymnasium Atari environment
 EVAL_EPISODES = 30       # number of episodes for evaluation
+
+# Environment IDs differ by backend
+_ENV_IDS = {
+    "envpool": "Breakout-v5",
+    "gymnasium": "ALE/Breakout-v5",
+}
+ENV_ID = _ENV_IDS[BACKEND]
 
 # ---------------------------------------------------------------------------
 # Environment creation
 # ---------------------------------------------------------------------------
 
-def _make_single_env(env_id, render_mode=None):
-    """Factory that returns a function creating a single preprocessed Atari env."""
-    def _thunk():
-        # Re-register ALE envs in subprocess (needed for AsyncVectorEnv)
-        try:
-            import ale_py as _ale_py
-            gym.register_envs(_ale_py)
-        except Exception:
-            pass
-        env = gym.make(env_id, frameskip=1, repeat_action_probability=0,
-                       render_mode=render_mode)
-        env = gym.wrappers.AtariPreprocessing(env)
-        env = gym.wrappers.FrameStackObservation(env, stack_size=4)
-        return env
-    return _thunk
+def make_env(env_id=None, num_envs=1):
+    """Create vectorized Atari environments.
 
-
-def make_env(env_id=ENV_ID, num_envs=1):
-    """Create Gymnasium vectorized Atari environments with standard preprocessing.
-
-    Uses AsyncVectorEnv (subprocess-based) for num_envs > 1 for parallelism.
-    Uses SyncVectorEnv for num_envs == 1 to avoid subprocess overhead.
-
-    Preprocessing:
-    - NoopReset (up to 30 no-ops, via AtariPreprocessing)
-    - MaxAndSkip (frame skip=4, max over last 2 frames)
-    - Resize to 84x84, Grayscale
-    - FrameStack(4)
-
-    Returns obs shape: (num_envs, 4, 84, 84) as uint8.
+    envpool backend: C++ thread pool, zero Python overhead.
+        Obs shape: (num_envs, 4, 84, 84) uint8.
+    gymnasium backend: SyncVectorEnv (no subprocess overhead).
+        Obs shape: (num_envs, 4, 84, 84) uint8.
     """
-    env_fns = [_make_single_env(env_id) for _ in range(num_envs)]
-    if num_envs == 1:
-        return gym.vector.SyncVectorEnv(env_fns)
+    if env_id is None:
+        env_id = ENV_ID
+
+    if BACKEND == "envpool":
+        return envpool.make(
+            env_id,
+            env_type="gymnasium",
+            num_envs=num_envs,
+            batch_size=num_envs,
+            seed=42,
+            episodic_life=True,
+            repeat_action_probability=0,
+            img_height=84,
+            img_width=84,
+            stack_num=4,
+            gray_scale=True,
+            frame_skip=4,
+            noop_max=30,
+        )
     else:
-        return gym.vector.AsyncVectorEnv(env_fns)
+        def _make_single():
+            # Re-register ALE in case we're in a subprocess
+            try:
+                import ale_py as _ale_py
+                gym.register_envs(_ale_py)
+            except Exception:
+                pass
+            env = gym.make(env_id, frameskip=1, repeat_action_probability=0)
+            env = gym.wrappers.AtariPreprocessing(env)
+            env = gym.wrappers.FrameStackObservation(env, stack_size=4)
+            return env
+
+        env_fns = [_make_single for _ in range(num_envs)]
+        return gym.vector.SyncVectorEnv(env_fns)
 
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_return(agent, device, env_id=ENV_ID, num_eval_envs=8):
+def evaluate_return(agent, device, env_id=None, num_eval_envs=16):
     """
     Run EVAL_EPISODES greedy episodes and return the mean episodic return.
     Uses argmax (greedy) action selection for deterministic evaluation.
     Higher is better.
     """
+    if env_id is None:
+        env_id = ENV_ID
+
     envs = make_env(env_id, num_envs=num_eval_envs)
     obs, _ = envs.reset()
 
@@ -108,6 +131,7 @@ def evaluate_return(agent, device, env_id=ENV_ID, num_eval_envs=8):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    print(f"Backend: {BACKEND}")
     print(f"Environment: {ENV_ID}")
     print(f"Eval episodes: {EVAL_EPISODES}")
     print(f"Time budget: {TIME_BUDGET}s")
@@ -115,7 +139,7 @@ if __name__ == "__main__":
 
     # Test single env
     print("Testing single environment...")
-    env = make_env(ENV_ID, num_envs=1)
+    env = make_env(num_envs=1)
     obs, info = env.reset()
     obs = np.asarray(obs)
     print(f"  Observation shape: {obs.shape}, dtype: {obs.dtype}")
@@ -133,22 +157,23 @@ if __name__ == "__main__":
     print(f"  Ran {steps} steps, total reward: {total_reward}")
     print()
 
-    # Test vectorized env (async)
-    num_test_envs = 16
-    print(f"Testing async vectorized environment ({num_test_envs} envs)...")
-    env = make_env(ENV_ID, num_envs=num_test_envs)
+    # Test vectorized env
+    num_test_envs = 64
+    print(f"Testing vectorized environment ({num_test_envs} envs)...")
+    env = make_env(num_envs=num_test_envs)
     obs, info = env.reset()
     obs = np.asarray(obs)
     print(f"  Observation shape: {obs.shape}, dtype: {obs.dtype}")
 
     t0 = time.time()
-    for _ in range(500):
+    num_steps = 1000
+    for _ in range(num_steps):
         actions = np.array([env.single_action_space.sample() for _ in range(num_test_envs)])
         obs, reward, term, trunc, info = env.step(actions)
     dt = time.time() - t0
-    fps = num_test_envs * 500 / dt
+    fps = num_test_envs * num_steps / dt
     env.close()
-    print(f"  500 steps x {num_test_envs} envs in {dt:.2f}s ({fps:.0f} fps)")
+    print(f"  {num_steps} steps x {num_test_envs} envs in {dt:.2f}s ({fps:,.0f} fps)")
     print()
 
     print("Done! Environment setup verified.")

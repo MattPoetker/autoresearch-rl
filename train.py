@@ -17,7 +17,7 @@ from prepare import TIME_BUDGET, ENV_ID, make_env, evaluate_return
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-NUM_ENVS = 24            # number of parallel environments (match CPU thread count)
+NUM_ENVS = 128           # number of parallel environments
 NUM_STEPS = 128          # rollout length per update
 LR = 2.5e-4             # learning rate
 GAMMA = 0.99             # discount factor
