@@ -126,6 +126,10 @@ if __name__ == "__main__":
     total_frames = 0
     num_updates = 0
 
+    # Episode return tracking
+    ep_returns = []  # completed episode returns
+    current_ep_returns = np.zeros(NUM_ENVS, dtype=np.float64)
+
     obs_np, _ = env.reset()
     next_obs = torch.from_numpy(np.asarray(obs_np))
     next_done = torch.zeros(NUM_ENVS)
@@ -154,8 +158,17 @@ if __name__ == "__main__":
 
             obs_np, reward, term, trunc, info = env.step(action.cpu().numpy())
             next_obs = torch.from_numpy(np.asarray(obs_np))
-            next_done = torch.from_numpy(np.asarray(term | trunc)).float()
-            rewards_buf[step] = torch.from_numpy(np.asarray(reward, dtype=np.float32))
+            dones = np.asarray(term | trunc)
+            next_done = torch.from_numpy(dones).float()
+            reward_np = np.asarray(reward, dtype=np.float32)
+            rewards_buf[step] = torch.from_numpy(reward_np)
+
+            # Track episode returns
+            current_ep_returns += reward_np
+            for i in range(NUM_ENVS):
+                if dones[i]:
+                    ep_returns.append(current_ep_returns[i])
+                    current_ep_returns[i] = 0.0
 
         # --- GAE computation ---
         with torch.no_grad():
@@ -244,7 +257,8 @@ if __name__ == "__main__":
         pct_done = 100 * progress
         fps = int(batch_size / dt)
         remaining = max(0, TIME_BUDGET - total_training_time)
-        print(f"\rupdate {num_updates:04d} ({pct_done:.1f}%) | loss: {loss.item():.4f} | pg: {pg_loss.item():.4f} | vf: {v_loss.item():.4f} | ent: {entropy_loss.item():.4f} | lr: {lr_now:.2e} | fps: {fps:,} | remaining: {remaining:.0f}s    ", end="", flush=True)
+        avg_ep_ret = np.mean(ep_returns[-100:]) if ep_returns else 0.0
+        print(f"\rupdate {num_updates:04d} ({pct_done:.1f}%) | ret: {avg_ep_ret:.1f} | loss: {loss.item():.4f} | fps: {fps:,} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
         # Time's up — but only stop after warmup updates
         if num_updates > 2 and total_training_time >= TIME_BUDGET:
