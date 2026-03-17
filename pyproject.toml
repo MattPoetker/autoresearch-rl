@@ -5,14 +5,11 @@ description = "Autonomous RL research swarm"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "gymnasium[atari,other]>=1.1.0; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "gymnasium[atari,other]>=0.26.0",
     "matplotlib>=3.10.8",
     "numpy>=2.2.6; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "numpy<2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "pandas>=2.3.3",
-    "ale-py==0.8.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-    "autorom[accept-rom-license]~=0.6.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-    "pufferlib>=2.0.5; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "torch>=2.3.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "torch>=2.0.0,<=2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]

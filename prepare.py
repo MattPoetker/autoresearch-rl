@@ -1,7 +1,6 @@
 """
 Environment setup and evaluation for autoresearch RL experiments.
-Uses PufferLib for fast vectorized environments when available,
-falls back to Gymnasium otherwise.
+Provides vectorized Atari environments via Gymnasium.
 
 Usage:
     python prepare.py   # verify environment setup
@@ -11,83 +10,76 @@ import time
 
 import numpy as np
 import torch
+import gymnasium as gym
 
-# ---------------------------------------------------------------------------
-# Backend detection: PufferLib (fast) or Gymnasium (fallback)
-# ---------------------------------------------------------------------------
-
+# Register ALE environments
 try:
-    import pufferlib
-    import pufferlib.vector
-    import pufferlib.environments.atari
-    BACKEND = "pufferlib"
-except ImportError:
-    import gymnasium as gym
     import ale_py
     gym.register_envs(ale_py)
-    BACKEND = "gymnasium"
+except Exception:
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
+ENV_ID = "ALE/Breakout-v5"  # Gymnasium Atari environment
 EVAL_EPISODES = 30       # number of episodes for evaluation
-
-# Environment IDs differ by backend
-_ENV_IDS = {
-    "pufferlib": "breakout",
-    "gymnasium": "ALE/Breakout-v5",
-}
-ENV_ID = _ENV_IDS[BACKEND]
 
 # ---------------------------------------------------------------------------
 # Environment creation
 # ---------------------------------------------------------------------------
 
-def _gym_atari_preprocess(env):
-    """Standard Atari preprocessing for Gymnasium backend."""
-    env = gym.wrappers.AtariPreprocessing(env)
-    env = gym.wrappers.FrameStackObservation(env, stack_size=4)
-    return env
+def _make_single_env(env_id, render_mode=None):
+    """Factory that returns a function creating a single preprocessed Atari env."""
+    def _thunk():
+        # Re-register ALE envs in subprocess (needed for AsyncVectorEnv)
+        try:
+            import ale_py as _ale_py
+            gym.register_envs(_ale_py)
+        except Exception:
+            pass
+        env = gym.make(env_id, frameskip=1, repeat_action_probability=0,
+                       render_mode=render_mode)
+        env = gym.wrappers.AtariPreprocessing(env)
+        env = gym.wrappers.FrameStackObservation(env, stack_size=4)
+        return env
+    return _thunk
 
 
-def make_env(env_id=None, num_envs=1):
-    """Create vectorized Atari environments.
+def make_env(env_id=ENV_ID, num_envs=1):
+    """Create Gymnasium vectorized Atari environments with standard preprocessing.
 
-    PufferLib backend: C++-optimized vectorization, obs shape (C, H, W).
-    Gymnasium backend: sync vectorization with standard preprocessing,
-                       obs shape (4, 84, 84).
+    Uses AsyncVectorEnv (subprocess-based) for num_envs > 1 for parallelism.
+    Uses SyncVectorEnv for num_envs == 1 to avoid subprocess overhead.
+
+    Preprocessing:
+    - NoopReset (up to 30 no-ops, via AtariPreprocessing)
+    - MaxAndSkip (frame skip=4, max over last 2 frames)
+    - Resize to 84x84, Grayscale
+    - FrameStack(4)
+
+    Returns obs shape: (num_envs, 4, 84, 84) as uint8.
     """
-    if env_id is None:
-        env_id = ENV_ID
-
-    if BACKEND == "pufferlib":
-        return pufferlib.vector.make(
-            pufferlib.environments.atari.env_creator(env_id),
-            env_kwargs=dict(framestack=4),
-            backend=pufferlib.vector.Multiprocessing,
-            num_envs=num_envs,
-        )
+    env_fns = [_make_single_env(env_id) for _ in range(num_envs)]
+    if num_envs == 1:
+        return gym.vector.SyncVectorEnv(env_fns)
     else:
-        return gym.make_vec(env_id, num_envs=num_envs, vectorization_mode="sync",
-                            frameskip=1, repeat_action_probability=0,
-                            wrappers=[_gym_atari_preprocess])
+        return gym.vector.AsyncVectorEnv(env_fns)
 
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_return(agent, device, env_id=None, num_eval_envs=16):
+def evaluate_return(agent, device, env_id=ENV_ID, num_eval_envs=8):
     """
     Run EVAL_EPISODES greedy episodes and return the mean episodic return.
     Uses argmax (greedy) action selection for deterministic evaluation.
     Higher is better.
     """
-    if env_id is None:
-        env_id = ENV_ID
-
     envs = make_env(env_id, num_envs=num_eval_envs)
     obs, _ = envs.reset()
 
@@ -116,7 +108,6 @@ def evaluate_return(agent, device, env_id=None, num_eval_envs=16):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"Backend: {BACKEND}")
     print(f"Environment: {ENV_ID}")
     print(f"Eval episodes: {EVAL_EPISODES}")
     print(f"Time budget: {TIME_BUDGET}s")
@@ -124,7 +115,7 @@ if __name__ == "__main__":
 
     # Test single env
     print("Testing single environment...")
-    env = make_env(num_envs=1)
+    env = make_env(ENV_ID, num_envs=1)
     obs, info = env.reset()
     obs = np.asarray(obs)
     print(f"  Observation shape: {obs.shape}, dtype: {obs.dtype}")
@@ -142,10 +133,10 @@ if __name__ == "__main__":
     print(f"  Ran {steps} steps, total reward: {total_reward}")
     print()
 
-    # Test vectorized env
+    # Test vectorized env (async)
     num_test_envs = 16
-    print(f"Testing vectorized environment ({num_test_envs} envs)...")
-    env = make_env(num_envs=num_test_envs)
+    print(f"Testing async vectorized environment ({num_test_envs} envs)...")
+    env = make_env(ENV_ID, num_envs=num_test_envs)
     obs, info = env.reset()
     obs = np.asarray(obs)
     print(f"  Observation shape: {obs.shape}, dtype: {obs.dtype}")
