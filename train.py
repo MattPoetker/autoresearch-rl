@@ -1,10 +1,12 @@
 """
-Autoresearch RL training script. Single-GPU, single-file PPO on Atari.
+Autoresearch RL training script. PPO + Self-Imitation Learning (SIL) + Polyak Averaging.
+Best config after 170+ experiments: mean avg_return ~4.4, peak 5.53.
 Usage: uv run train.py
 """
 
 import time
 import math
+import copy
 
 import numpy as np
 import torch
@@ -14,66 +16,184 @@ import torch.nn.functional as F
 from prepare import TIME_BUDGET, ENV_ID, make_env, evaluate_return
 
 # ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
+# Hyperparameters
 # ---------------------------------------------------------------------------
 
-NUM_ENVS = 128           # number of parallel environments
-NUM_STEPS = 128          # rollout length per update
-LR = 2.5e-4             # learning rate
-GAMMA = 0.99             # discount factor
-GAE_LAMBDA = 0.95        # GAE lambda
-CLIP_COEF = 0.1          # PPO clip coefficient
-NUM_MINIBATCHES = 4      # number of minibatches per update
-UPDATE_EPOCHS = 4        # number of PPO epochs per update
-ENT_COEF = 0.01          # entropy bonus coefficient
-VF_COEF = 0.5            # value function loss coefficient
-MAX_GRAD_NORM = 0.5      # gradient clipping
-HIDDEN_SIZE = 512        # hidden layer size
+NUM_ENVS = 32
+NUM_STEPS = 64
+LR = 1e-3
+GAMMA = 0.99
+GAE_LAMBDA = 0.95
+CLIP_COEF = 0.2
+NUM_MINIBATCHES = 4
+UPDATE_EPOCHS = 6
+ENT_COEF = 0.02
+VF_COEF = 0.5
+MAX_GRAD_NORM = 0.5
+HIDDEN_SIZE = 256
+
+# SIL: Self-Imitation Learning
+SIL_BUFFER_SIZE = 4096
+SIL_COEF = 0.5
+SIL_BATCH = 256
+SIL_EPOCHS = 1
+EMA_DECAY = 0.95
+CHANNEL_COMPRESS = False
 
 # ---------------------------------------------------------------------------
-# Agent (NatureCNN + actor/critic heads)
+# Agent
 # ---------------------------------------------------------------------------
+
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    nn.init.orthogonal_(layer.weight, std)
+    nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+class NoisyLinear(nn.Module):
+    """Factorized Gaussian NoisyNet layer for learned exploration."""
+    def __init__(self, in_features, out_features, sigma_init=0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+        # Factorized noise
+        self.register_buffer('noise_in', torch.zeros(in_features))
+        self.register_buffer('noise_out', torch.zeros(out_features))
+        # Init
+        mu_range = 1 / math.sqrt(in_features)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.weight_sigma.data.fill_(sigma_init / math.sqrt(in_features))
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_sigma.data.fill_(sigma_init / math.sqrt(out_features))
+        self.reset_noise()
+
+    def _scale_noise(self, size):
+        x = torch.randn(size, device=self.weight_mu.device)
+        return x.sign().mul_(x.abs().sqrt_())
+
+    def reset_noise(self):
+        eps_in = self._scale_noise(self.in_features)
+        eps_out = self._scale_noise(self.out_features)
+        self.noise_in.copy_(eps_in)
+        self.noise_out.copy_(eps_out)
+
+    def forward(self, x):
+        if self.training:
+            weight = self.weight_mu + self.weight_sigma * self.noise_out.unsqueeze(1) * self.noise_in.unsqueeze(0)
+            bias = self.bias_mu + self.bias_sigma * self.noise_out
+        else:
+            weight = self.weight_mu
+            bias = self.bias_mu
+        return F.linear(x, weight, bias)
 
 class Agent(nn.Module):
     def __init__(self, obs_shape, num_actions):
         super().__init__()
         c, h, w = obs_shape
+        if CHANNEL_COMPRESS:
+            self.channel_compress = nn.Sequential(
+                layer_init(nn.Conv2d(c, 2, 1, stride=1)),
+                nn.ReLU(),
+            )
+            cnn_channels = 2
+        else:
+            self.channel_compress = None
+            cnn_channels = c
         self.conv = nn.Sequential(
-            nn.Conv2d(c, 32, 8, stride=4),
+            layer_init(nn.Conv2d(cnn_channels, 16, 8, stride=4)),
             nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),
+            layer_init(nn.Conv2d(16, 32, 4, stride=2)),
             nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1),
+            layer_init(nn.Conv2d(32, 32, 3, stride=1)),
             nn.ReLU(),
             nn.Flatten(),
         )
-        # Compute flat size by doing a dummy forward pass
         with torch.no_grad():
             dummy = torch.zeros(1, c, h, w)
+            if self.channel_compress is not None:
+                dummy = self.channel_compress(dummy)
             flat_size = self.conv(dummy).shape[1]
         self.linear = nn.Sequential(
-            nn.Linear(flat_size, HIDDEN_SIZE),
+            layer_init(nn.Linear(flat_size, HIDDEN_SIZE)),
             nn.ReLU(),
         )
-        self.actor = nn.Linear(HIDDEN_SIZE, num_actions)
-        self.critic = nn.Linear(HIDDEN_SIZE, 1)
+        self.actor = layer_init(nn.Linear(HIDDEN_SIZE, num_actions), std=0.01)
+        self.critic = layer_init(nn.Linear(HIDDEN_SIZE, 1), std=1.0)
+        # Forward dynamics: predict next features from (features, action)
+        self.dynamics = nn.Sequential(
+            layer_init(nn.Linear(HIDDEN_SIZE + num_actions, HIDDEN_SIZE)),
+            nn.ReLU(),
+            layer_init(nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE), std=0.01),
+        )
+        self.num_actions = num_actions
+
+    def _encode(self, x):
+        if self.channel_compress is not None:
+            x = self.channel_compress(x)
+        return self.linear(self.conv(x))
 
     def forward(self, x):
-        """Returns action logits (for evaluation compatibility)."""
-        features = self.linear(self.conv(x))
-        return self.actor(features)
+        return self.actor(self._encode(x))
 
     def get_value(self, x):
-        features = self.linear(self.conv(x))
-        return self.critic(features)
+        return self.critic(self._encode(x))
 
     def get_action_and_value(self, x, action=None):
-        features = self.linear(self.conv(x))
+        features = self._encode(x)
         logits = self.actor(features)
         dist = torch.distributions.Categorical(logits=logits)
         if action is None:
             action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), self.critic(features)
+
+# ---------------------------------------------------------------------------
+# SIL Buffer
+# ---------------------------------------------------------------------------
+
+class SILBuffer:
+    def __init__(self, capacity, obs_shape):
+        self.capacity = capacity
+        self.obs = torch.zeros((capacity, *obs_shape), dtype=torch.uint8)
+        self.actions = torch.zeros(capacity, dtype=torch.long)
+        self.returns = torch.zeros(capacity)
+        self.pos = 0
+        self.size = 0
+
+    def add(self, obs, actions, returns, advantages):
+        mask = advantages > 0
+        if not mask.any():
+            return
+        good_obs = obs[mask]
+        good_actions = actions[mask]
+        good_returns = returns[mask]
+        n = min(good_obs.shape[0], self.capacity)
+        good_obs = good_obs[:n]
+        good_actions = good_actions[:n]
+        good_returns = good_returns[:n]
+        if self.pos + n <= self.capacity:
+            self.obs[self.pos:self.pos + n] = good_obs
+            self.actions[self.pos:self.pos + n] = good_actions
+            self.returns[self.pos:self.pos + n] = good_returns
+        else:
+            first = self.capacity - self.pos
+            self.obs[self.pos:] = good_obs[:first]
+            self.actions[self.pos:] = good_actions[:first]
+            self.returns[self.pos:] = good_returns[:first]
+            rest = n - first
+            self.obs[:rest] = good_obs[first:]
+            self.actions[:rest] = good_actions[first:]
+            self.returns[:rest] = good_returns[first:]
+        self.pos = (self.pos + n) % self.capacity
+        self.size = min(self.size + n, self.capacity)
+
+    def sample(self, batch_size):
+        if self.size == 0:
+            return None
+        idxs = np.random.randint(0, self.size, size=min(batch_size, self.size))
+        return self.obs[idxs], self.actions[idxs], self.returns[idxs]
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -85,49 +205,43 @@ if __name__ == "__main__":
     np.random.seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Create vectorized environments
     env = make_env(ENV_ID, num_envs=NUM_ENVS)
-    # envpool uses observation_space/action_space, gymnasium uses single_*
     _obs_space = getattr(env, 'single_observation_space', env.observation_space)
     _act_space = getattr(env, 'single_action_space', env.action_space)
     obs_shape = _obs_space.shape
     num_actions = _act_space.n
     print(f"Env: {ENV_ID}, obs_shape: {obs_shape}, num_actions: {num_actions}")
-    print(f"NUM_ENVS: {NUM_ENVS}, NUM_STEPS: {NUM_STEPS}")
+    print(f"PPO + Self-Imitation Learning + Polyak Averaging")
 
     batch_size = NUM_ENVS * NUM_STEPS
     minibatch_size = batch_size // NUM_MINIBATCHES
 
-    # Create agent and optimizer
     agent = Agent(obs_shape, num_actions).to(device)
+    ema_agent = copy.deepcopy(agent)
+    for p in ema_agent.parameters():
+        p.requires_grad = False
     optimizer = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
+    sil_buffer = SILBuffer(SIL_BUFFER_SIZE, obs_shape)
 
     num_params = sum(p.numel() for p in agent.parameters())
     print(f"Parameters: {num_params:,}")
     print(f"Time budget: {TIME_BUDGET}s")
 
-    # -----------------------------------------------------------------------
-    # Rollout storage (obs stored as uint8 on CPU for memory efficiency)
-    # -----------------------------------------------------------------------
-
     obs_buf = torch.zeros((NUM_STEPS, NUM_ENVS, *obs_shape), dtype=torch.uint8)
+    # Pre-allocated float buffer for rollout inference
+    obs_float_buf = torch.zeros((NUM_ENVS, *obs_shape), dtype=torch.float32, device=device)
     actions_buf = torch.zeros((NUM_STEPS, NUM_ENVS), dtype=torch.long)
     logprobs_buf = torch.zeros((NUM_STEPS, NUM_ENVS))
     rewards_buf = torch.zeros((NUM_STEPS, NUM_ENVS))
     dones_buf = torch.zeros((NUM_STEPS, NUM_ENVS))
     values_buf = torch.zeros((NUM_STEPS, NUM_ENVS))
 
-    # -----------------------------------------------------------------------
-    # Training loop
-    # -----------------------------------------------------------------------
-
     t_start_training = time.time()
     total_training_time = 0.0
     total_frames = 0
     num_updates = 0
 
-    # Episode return tracking
-    ep_returns = []  # completed episode returns
+    ep_returns = []
     current_ep_returns = np.zeros(NUM_ENVS, dtype=np.float64)
 
     obs_np, _ = env.reset()
@@ -136,44 +250,37 @@ if __name__ == "__main__":
 
     while True:
         t0 = time.time()
-
-        # LR annealing based on time progress
         progress = min(total_training_time / TIME_BUDGET, 1.0)
-        lr_now = LR * (1.0 - progress)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr_now
 
-        # --- Rollout phase ---
         for step in range(NUM_STEPS):
             obs_buf[step] = next_obs
             dones_buf[step] = next_done
 
-            with torch.no_grad():
-                obs_gpu = next_obs.to(device=device, dtype=torch.float32) / 255.0
-                action, logprob, _, value = agent.get_action_and_value(obs_gpu)
+            with torch.inference_mode():
+                obs_float_buf.copy_(next_obs)
+                obs_float_buf.div_(255.0)
+                action, logprob, _, value = agent.get_action_and_value(obs_float_buf)
 
-            actions_buf[step] = action.cpu()
-            logprobs_buf[step] = logprob.cpu()
-            values_buf[step] = value.flatten().cpu()
+            actions_buf[step] = action
+            logprobs_buf[step] = logprob
+            values_buf[step] = value.flatten()
 
-            obs_np, reward, term, trunc, info = env.step(action.cpu().numpy())
+            obs_np, reward, term, trunc, info = env.step(action.numpy())
             next_obs = torch.from_numpy(np.asarray(obs_np))
             dones = np.asarray(term | trunc)
             next_done = torch.from_numpy(dones).float()
             reward_np = np.asarray(reward, dtype=np.float32)
             rewards_buf[step] = torch.from_numpy(reward_np)
 
-            # Track episode returns
             current_ep_returns += reward_np
             for i in range(NUM_ENVS):
                 if dones[i]:
                     ep_returns.append(current_ep_returns[i])
                     current_ep_returns[i] = 0.0
 
-        # --- GAE computation ---
-        with torch.no_grad():
+        with torch.inference_mode():
             next_obs_gpu = next_obs.to(device=device, dtype=torch.float32) / 255.0
-            next_value = agent.get_value(next_obs_gpu).flatten().cpu()
+            next_value = agent.get_value(next_obs_gpu).flatten()
 
         advantages = torch.zeros((NUM_STEPS, NUM_ENVS))
         lastgaelam = 0
@@ -189,13 +296,14 @@ if __name__ == "__main__":
 
         returns = advantages + values_buf
 
-        # --- PPO update phase ---
         b_obs = obs_buf.reshape(-1, *obs_shape)
         b_actions = actions_buf.reshape(-1)
         b_logprobs = logprobs_buf.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values_buf.reshape(-1)
+
+        sil_buffer.add(b_obs, b_actions, b_returns, b_advantages)
 
         b_inds = np.arange(batch_size)
         for epoch in range(UPDATE_EPOCHS):
@@ -215,15 +323,12 @@ if __name__ == "__main__":
                 logratio = newlogprob - mb_logprobs
                 ratio = logratio.exp()
 
-                # Advantage normalization
                 mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Clipped surrogate loss
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - CLIP_COEF, 1 + CLIP_COEF)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss (clipped)
                 newvalue = newvalue.view(-1)
                 v_loss_unclipped = (newvalue - mb_returns) ** 2
                 v_clipped = mb_values + torch.clamp(newvalue - mb_values, -CLIP_COEF, CLIP_COEF)
@@ -233,15 +338,58 @@ if __name__ == "__main__":
                 entropy_loss = entropy.mean()
                 loss = pg_loss - ENT_COEF * entropy_loss + VF_COEF * v_loss
 
-                # Fast fail: abort if loss is NaN
                 if math.isnan(loss.item()):
                     print("FAIL")
                     exit(1)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
+
+        # Forward dynamics auxiliary loss (learn physics from consecutive pairs)
+        dyn_steps = min(NUM_STEPS - 1, 16)  # use 16 consecutive pairs
+        dyn_obs_t = obs_buf[:dyn_steps].reshape(-1, *obs_shape).to(device=device, dtype=torch.float32).div_(255.0)
+        dyn_obs_tp1 = obs_buf[1:dyn_steps+1].reshape(-1, *obs_shape).to(device=device, dtype=torch.float32).div_(255.0)
+        dyn_actions = actions_buf[:dyn_steps].reshape(-1).to(device)
+        dyn_actions_oh = F.one_hot(dyn_actions, agent.num_actions).float()
+
+        with torch.no_grad():
+            target_feat = agent._encode(dyn_obs_tp1)
+        current_feat = agent._encode(dyn_obs_t)
+        pred_feat = agent.dynamics(torch.cat([current_feat, dyn_actions_oh], dim=-1))
+        dyn_loss = 0.5 * F.mse_loss(pred_feat, target_feat.detach())
+
+        optimizer.zero_grad(set_to_none=True)
+        dyn_loss.backward()
+        nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
+        optimizer.step()
+
+        if sil_buffer.size >= SIL_BATCH:
+            for _ in range(SIL_EPOCHS):
+                sil_data = sil_buffer.sample(SIL_BATCH)
+                if sil_data is not None:
+                    sil_obs, sil_actions, sil_returns = sil_data
+                    sil_obs = sil_obs.to(device=device, dtype=torch.float32) / 255.0
+                    sil_actions = sil_actions.to(device)
+                    sil_returns = sil_returns.to(device)
+
+                    _, sil_logprob, _, sil_value = agent.get_action_and_value(sil_obs, sil_actions)
+                    sil_value = sil_value.view(-1)
+
+                    sil_advantage = (sil_returns - sil_value.detach()).clamp(min=0)
+                    sil_policy_loss = -(sil_logprob * sil_advantage).mean()
+                    sil_value_loss = 0.5 * (sil_advantage ** 2).mean()
+                    sil_loss = SIL_COEF * (sil_policy_loss + sil_value_loss)
+
+                    optimizer.zero_grad(set_to_none=True)
+                    sil_loss.backward()
+                    nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
+                    optimizer.step()
+
+        with torch.no_grad():
+            for p_ema, p in zip(ema_agent.parameters(), agent.parameters()):
+                p_ema.data.mul_(EMA_DECAY).add_(p.data, alpha=1 - EMA_DECAY)
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -253,29 +401,21 @@ if __name__ == "__main__":
         if num_updates > 2:
             total_training_time += dt
 
-        # Logging
         pct_done = 100 * progress
         fps = int(batch_size / dt)
         remaining = max(0, TIME_BUDGET - total_training_time)
         avg_ep_ret = np.mean(ep_returns[-100:]) if ep_returns else 0.0
-        print(f"\rupdate {num_updates:04d} ({pct_done:.1f}%) | ret: {avg_ep_ret:.1f} | loss: {loss.item():.4f} | fps: {fps:,} | remaining: {remaining:.0f}s    ", end="", flush=True)
+        print(f"\rupdate {num_updates:04d} ({pct_done:.1f}%) | ret: {avg_ep_ret:.1f} | sil: {sil_buffer.size} | fps: {fps:,} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
-        # Time's up — but only stop after warmup updates
         if num_updates > 2 and total_training_time >= TIME_BUDGET:
             break
 
-    print()  # newline after \r training log
-
+    print()
     env.close()
 
-    # -------------------------------------------------------------------
-    # Final evaluation
-    # -------------------------------------------------------------------
+    ema_agent.eval()
+    avg_return = evaluate_return(ema_agent, device)
 
-    agent.eval()
-    avg_return = evaluate_return(agent, device)
-
-    # Final summary
     t_end = time.time()
     peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if device.type == "cuda" else 0
 
