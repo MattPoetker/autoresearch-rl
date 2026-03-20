@@ -261,11 +261,11 @@ if __name__ == "__main__":
                 obs_float_buf.div_(255.0)
                 action, logprob, _, value = agent.get_action_and_value(obs_float_buf)
 
-            actions_buf[step] = action
-            logprobs_buf[step] = logprob
-            values_buf[step] = value.flatten()
+            actions_buf[step] = action.cpu()
+            logprobs_buf[step] = logprob.cpu()
+            values_buf[step] = value.flatten().cpu()
 
-            obs_np, reward, term, trunc, info = env.step(action.numpy())
+            obs_np, reward, term, trunc, info = env.step(action.cpu().numpy())
             next_obs = torch.from_numpy(np.asarray(obs_np))
             dones = np.asarray(term | trunc)
             next_done = torch.from_numpy(dones).float()
@@ -280,7 +280,7 @@ if __name__ == "__main__":
 
         with torch.inference_mode():
             next_obs_gpu = next_obs.to(device=device, dtype=torch.float32) / 255.0
-            next_value = agent.get_value(next_obs_gpu).flatten()
+            next_value = agent.get_value(next_obs_gpu).flatten().cpu()
 
         advantages = torch.zeros((NUM_STEPS, NUM_ENVS))
         lastgaelam = 0
